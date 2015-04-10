@@ -1,14 +1,20 @@
 # coding: utf-8
 
 import random
+import struct
 import time
+import math
 from collections import OrderedDict
 from uuid import uuid4, UUID
 
+from thrift_bindings.v30.ttypes import CfDef, Mutation, ColumnOrSuperColumn, Column
+from thrift_bindings.v30.ttypes import ConsistencyLevel as ThriftConsistencyLevel
+
 from dtest import Tester, canReuseCluster, freshCluster
 from assertions import assert_invalid, assert_one, assert_none, assert_all
+from thrift_tests import get_thrift_client
 from tools import since, require, rows_to_list
-from cassandra import ConsistencyLevel, InvalidRequest
+from cassandra import ConsistencyLevel, InvalidRequest, AlreadyExists
 from cassandra.protocol import ProtocolException, SyntaxException, ConfigurationException, InvalidRequestException
 from cassandra.query import SimpleStatement
 from cassandra.util import sortedset
@@ -1035,62 +1041,70 @@ class TestCQL(Tester):
         # Reserved keywords
         assert_invalid(cursor, "CREATE TABLE test1 (select int PRIMARY KEY, column int)", expected=SyntaxException)
 
-    #def keyspace_test(self):
-    #    cursor = self.prepare()
+    def keyspace_test(self):
+        cursor = self.prepare()
 
-    #    assert_invalid(cursor, "CREATE KEYSPACE test1")
-    #    cursor.execute("CREATE KEYSPACE test2 WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 }")
-    #    assert_invalid(cursor, "CREATE KEYSPACE My_much_much_too_long_identifier_that_should_not_work WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 }")
+        assert_invalid(cursor, "CREATE KEYSPACE test1",
+                       expected=SyntaxException,
+                       matching="code=2000")
+        cursor.execute("CREATE KEYSPACE test2 WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 }")
+        assert_invalid(cursor, "CREATE KEYSPACE My_much_much_too_long_identifier_that_should_not_work WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 }")
 
-    #    cursor.execute("DROP KEYSPACE test2")
-    #    assert_invalid(cursor, "DROP KEYSPACE non_existing")
-    #    cursor.execute("CREATE KEYSPACE test2 WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 }")
+        cursor.execute("DROP KEYSPACE test2")
+        assert_invalid(cursor, "DROP KEYSPACE non_existing",
+                       expected=ConfigurationException,
+                       matching="code=2300")
+        cursor.execute("CREATE KEYSPACE test2 WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 }")
 
-    #def table_test(self):
-    #    cursor = self.prepare()
+    def table_test(self):
+        cursor = self.prepare()
 
-    #    cursor.execute("""
-    #        CREATE TABLE test1 (
-    #            k int PRIMARY KEY,
-    #            c int
-    #        )
-    #    """)
+        cursor.execute("""
+            CREATE TABLE test1 (
+                k int PRIMARY KEY,
+                c int
+            )
+        """)
 
-    #    cursor.execute("""
-    #        CREATE TABLE test2 (
-    #            k int,
-    #            name int,
-    #            value int,
-    #            PRIMARY KEY(k, name)
-    #        ) WITH COMPACT STORAGE
-    #    """)
+        cursor.execute("""
+            CREATE TABLE test2 (
+                k int,
+                name int,
+                value int,
+                PRIMARY KEY(k, name)
+            ) WITH COMPACT STORAGE
+        """)
 
-    #    cursor.execute("""
-    #        CREATE TABLE test3 (
-    #            k int,
-    #            c int,
-    #            PRIMARY KEY (k),
-    #        )
-    #    """)
+        cursor.execute("""
+            CREATE TABLE test3 (
+                k int,
+                c int,
+                PRIMARY KEY (k),
+            )
+        """)
 
-    #    # existing table
-    #    assert_invalid(cursor, "CREATE TABLE test3 (k int PRIMARY KEY, c int)")
-    #    # repeated column
-    #    assert_invalid(cursor, "CREATE TABLE test4 (k int PRIMARY KEY, c int, k text)")
+        # existing table
+        assert_invalid(cursor, "CREATE TABLE test3 (k int PRIMARY KEY, c int)",
+                       expected=AlreadyExists,
+                       matching="ks.test3")
+        # repeated column
+        assert_invalid(cursor, "CREATE TABLE test4 (k int PRIMARY KEY, c int, k text)",
+                       matching="code=2200")
 
-    #    # compact storage limitations
-    #    assert_invalid(cursor, "CREATE TABLE test4 (k int, name, int, c1 int, c2 int, PRIMARY KEY(k, name)) WITH COMPACT STORAGE")
+        # compact storage limitations
+        assert_invalid(cursor, "CREATE TABLE test4 (k int, name, int, c1 int, c2 int, PRIMARY KEY(k, name)) WITH COMPACT STORAGE",
+                       expected=SyntaxException)
 
-    #    cursor.execute("DROP TABLE test1")
-    #    cursor.execute("TRUNCATE test2")
+        cursor.execute("DROP TABLE test1")
+        cursor.execute("TRUNCATE test2")
 
-    #    cursor.execute("""
-    #        CREATE TABLE test1 (
-    #            k int PRIMARY KEY,
-    #            c1 int,
-    #            c2 int,
-    #        )
-    #    """)
+        cursor.execute("""
+            CREATE TABLE test1 (
+                k int PRIMARY KEY,
+                c1 int,
+                c2 int,
+            )
+        """)
 
     def batch_test(self):
         cursor = self.prepare()
@@ -1708,14 +1722,22 @@ class TestCQL(Tester):
             )
         """)
 
-        cli = self.cluster.nodelist()[0].cli()
-        cli.do("use ks")
-        cli.do("set test[2]['4:v'] = int(200)")
-        assert not cli.has_errors(), cli.errors()
-        time.sleep(1.5)
+        node = self.cluster.nodelist()[0]
+        host, port = node.network_interfaces['thrift']
+        client = get_thrift_client(host, port)
+        client.transport.open()
+        client.set_keyspace('ks')
+        key = struct.pack('>i', 2)
+        column_name_component = struct.pack('>i', 4)
+        # component length + component + EOC + component length + component + EOC
+        column_name = '\x00\x04' + column_name_component + '\x00' + '\x00\x01' + 'v' + '\x00'
+        value = struct.pack('>i', 8)
+        client.batch_mutate(
+            {key: {'test': [Mutation(ColumnOrSuperColumn(column=Column(name=column_name, value=value, timestamp=100)))]}},
+            ThriftConsistencyLevel.ONE)
 
         res = cursor.execute("SELECT * FROM test")
-        assert rows_to_list(res) == [[2, 4, 200]], res
+        assert rows_to_list(res) == [[2, 4, 8]], res
 
     def row_existence_test(self):
         """ Check the semantic of CQL row existence (part of #4361) """
@@ -3033,13 +3055,23 @@ class TestCQL(Tester):
     def rename_test(self):
         cursor = self.prepare()
 
-        # The goal is to test renaming from an old cli value
-        cli = self.cluster.nodelist()[0].cli()
-        cli.do("use ks")
-        cli.do("create column family test with comparator='CompositeType(Int32Type, Int32Type, Int32Type)' "
-                + "and key_validation_class=UTF8Type and default_validation_class=UTF8Type")
-        cli.do("set test['foo']['4:3:2'] = 'bar'")
-        assert not cli.has_errors(), cli.errors()
+        node = self.cluster.nodelist()[0]
+        host, port = node.network_interfaces['thrift']
+        client = get_thrift_client(host, port)
+        client.transport.open()
+
+        cfdef = CfDef()
+        cfdef.keyspace = 'ks'
+        cfdef.name = 'test'
+        cfdef.column_type = 'Standard'
+        cfdef.comparator_type = 'CompositeType(Int32Type, Int32Type, Int32Type)'
+        cfdef.key_validation_class = 'UTF8Type'
+        cfdef.default_validation_class = 'UTF8Type'
+
+        client.set_keyspace('ks')
+        client.system_add_column_family(cfdef)
+
+        cursor.execute("INSERT INTO ks.test (key, column1, column2, column3, value) VALUES ('foo', 4, 3, 2, 'bar')")
 
         time.sleep(1)
 
@@ -3698,17 +3730,25 @@ class TestCQL(Tester):
         # we're not allowed to create a value index if we already have a key one
         assert_invalid(cursor, "CREATE INDEX ON test(m)")
 
-    #def nan_infinity_test(self):
-    #    cursor = self.prepare()
+    def nan_infinity_test(self):
+        cursor = self.prepare()
 
-    #    cursor.execute("CREATE TABLE test (f float PRIMARY KEY)")
+        cursor.execute("CREATE TABLE test (f float PRIMARY KEY)")
 
-    #    cursor.execute("INSERT INTO test(f) VALUES (NaN)")
-    #    cursor.execute("INSERT INTO test(f) VALUES (-NaN)")
-    #    cursor.execute("INSERT INTO test(f) VALUES (Infinity)")
-    #    cursor.execute("INSERT INTO test(f) VALUES (-Infinity)")
+        cursor.execute("INSERT INTO test(f) VALUES (NaN)")
+        cursor.execute("INSERT INTO test(f) VALUES (-NaN)")
+        cursor.execute("INSERT INTO test(f) VALUES (Infinity)")
+        cursor.execute("INSERT INTO test(f) VALUES (-Infinity)")
 
-    #    assert_all(cursor, "SELECT * FROM test", [[nan], [inf], [-inf]])
+        selected = rows_to_list(cursor.execute("SELECT * FROM test"))
+
+        # selected should be [[nan], [inf], [-inf]],
+        # but assert element-wise because NaN != NaN
+        assert len(selected) == 3
+        assert len(selected[0]) == 1
+        assert math.isnan(selected[0][0])
+        assert selected[1] == [float("inf")]
+        assert selected[2] == [float("-inf")]
 
     @since('2.0')
     def static_columns_test(self):
@@ -4843,10 +4883,20 @@ class TestCQL(Tester):
 
         # create and confirm
         cursor.execute("CREATE INDEX IF NOT EXISTS myindex ON my_test_table (value1)")
-        assert_one(
-            cursor,
-            """select index_name from system."IndexInfo" where table_name = 'my_test_ks'""",
-            ['my_test_table.myindex'])
+
+        # index building is asynch, wait for it to finish
+        for i in range(10):
+            results = cursor.execute(
+                """select index_name from system."IndexInfo" where table_name = 'my_test_ks'""")
+
+            if results:
+                self.assertEqual([('my_test_table.myindex',)], results)
+                break
+
+            time.sleep(0.5)
+        else:
+            # this is executed when 'break' is never called
+            self.fail("Didn't see my_test_table.myindex after polling for 5 seconds")
 
         # unsuccessful create since it's already there
         cursor.execute("CREATE INDEX IF NOT EXISTS myindex ON my_test_table (value1)")
@@ -5055,8 +5105,8 @@ class TestCQL(Tester):
         cursor.execute("INSERT INTO test (k, v) VALUES ( 1, {1:'a', 2:'b', 5:'e', 6:'f'})")
 
         assert_all(cursor, "SELECT v[1] FROM test", [['a'], ['a']])
-        assert_all(cursor, "SELECT v[5] FROM test", [[], []])
-        assert_all(cursor, "SELECT v[1] FROM test", [[], []])
+        assert_all(cursor, "SELECT v[5] FROM test", [[], ['e']])
+        assert_all(cursor, "SELECT v[4] FROM test", [['d'], []])
 
         assert_all(cursor, "SELECT v[1..3] FROM test", [['a', 'b', 'c'], ['a', 'b', 'e']])
         assert_all(cursor, "SELECT v[3..5] FROM test", [['c', 'd'], ['e']])
@@ -5179,7 +5229,20 @@ class TestCQL(Tester):
         cursor.execute("ALTER TABLE test WITH CACHING='ALL'")
         cursor.execute("INSERT INTO test (k,v) VALUES (0,0)")
         cursor.execute("INSERT INTO test (k,v) VALUES (1,1)")
-        cursor.execute("CREATE INDEX on test(v)")
+        cursor.execute("CREATE INDEX testindex on test(v)")
+
+        # wait for the index to be fully built
+        start = time.time()
+        while True:
+            results = cursor.execute("""SELECT * FROM system."IndexInfo" WHERE table_name = 'ks' AND index_name = 'test.testindex'""")
+            if results:
+                break
+
+            if time.time() - start > 10.0:
+                results = list(cursor.execute('SELECT * FROM system."IndexInfo"'))
+                raise Exception("Failed to build secondary index within ten seconds: %s" % (results,))
+            time.sleep(0.1)
+
         assert_all(cursor, "SELECT k FROM test WHERE v = 0", [[0]])
 
         self.cluster.stop()
