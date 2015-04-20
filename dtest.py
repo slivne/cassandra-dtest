@@ -287,6 +287,10 @@ class Tester(TestCase):
                             protocol_version=protocol_version, load_balancing_policy=load_balancing_policy)
         session = cluster.connect()
 
+        # temporarily increase client-side timeout to 1m to determine
+        # if the cluster is simply responding slowly to requests
+        session.default_timeout = 60.0
+
         if keyspace is not None:
             session.set_keyspace(keyspace)
 
@@ -407,7 +411,7 @@ class Tester(TestCase):
         reset_environment_vars()
 
         for con in self.connections:
-            con.shutdown()
+            con.cluster.shutdown()
 
         for runner in self.runners:
             try:
